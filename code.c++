@@ -19,12 +19,12 @@
 // D10 -> ENABLE
 //
 // Flex sensor behaviour:
-// More bending -> LOWER ADC value
+// More bending -> HIGHER ADC value
 //
 // Main control sequence:
 //
 // IDLE
-//   -> Flex detects bending
+//   -> BOTH Flex sensors detect bending
 // CLOSING
 //   -> FSR detects object contact
 // HOLD
@@ -63,12 +63,14 @@ const int EN_PIN   = 10;
 
 // Default Flex activation thresholds.
 // These can be updated using the SET button.
-int flex1Threshold = 163;
-int flex2Threshold = 163;
+// 200 is a grasp activation value, not the maximum bend reading.
+// Observed full bending can reach 300 or higher.
+int flex1Threshold = 200;
+int flex2Threshold = 200;
 
-// Straight Flex is approximately 256.
-// >= 240 is considered sufficiently straight.
-const int STRAIGHT_THRESHOLD = 240;
+// Straight Flex is approximately 40.
+// <= 60 is provisionally considered sufficiently straight.
+const int STRAIGHT_THRESHOLD = 60;
 
 // FSR contact threshold.
 // This value should be adjusted after physical testing.
@@ -252,7 +254,7 @@ void loop()
   // 4. Current Flex readings become the new thresholds.
   //
   // After calibration:
-  // Flex <= threshold -> grasp intention detected.
+  // BOTH Flex readings >= their thresholds -> grasp intention detected.
   // ==========================================================
 
   if (setButton == LOW &&
@@ -310,9 +312,9 @@ void loop()
   // Logic:
   // 1. Motor is disabled.
   // 2. Continuously monitor both Flex sensors.
-  // 3. Flex ADC decreases when the finger bends.
-  // 4. If either Flex sensor falls below its calibrated
-  //    threshold, grasp intention is detected.
+  // 3. Flex ADC increases when the finger bends.
+  // 4. If BOTH Flex sensors reach or exceed their calibrated
+  //    thresholds, grasp intention is detected.
   // 5. Reset stepCount to zero.
   // 6. Enable the motor.
   // 7. Set direction to CLOSE.
@@ -321,7 +323,7 @@ void loop()
   // Transition:
   //
   // IDLE -> CLOSING
-  // Condition: Flex1 OR Flex2 detects bending.
+  // Condition: Flex1 AND Flex2 detect bending.
   // ==========================================================
 
   if (state == IDLE)
@@ -331,12 +333,12 @@ void loop()
 
 
     // Check whether each finger is bent.
-    bool flex1Bent = flex1 <= flex1Threshold;
-    bool flex2Bent = flex2 <= flex2Threshold;
+    bool flex1Bent = flex1 >= flex1Threshold;
+    bool flex2Bent = flex2 >= flex2Threshold;
 
 
-    // Either Flex sensor can indicate grasp intention.
-    if (flex1Bent || flex2Bent)
+    // Both Flex sensors must indicate grasp intention.
+    if (flex1Bent && flex2Bent)
     {
       // Start closing.
       state = CLOSING;
@@ -507,7 +509,7 @@ void loop()
   // 2. It does NOT rely on the normal stepCount.
   // 3. Motor moves in the OPEN direction.
   // 4. Continuously monitor both Flex sensors.
-  // 5. A Flex value >= STRAIGHT_THRESHOLD means that
+  // 5. A Flex value <= STRAIGHT_THRESHOLD means that
   //    finger is considered sufficiently straight.
   // 6. BOTH Flex sensors must indicate straight fingers.
   // 7. When home is reached, reset all position counters.
@@ -530,8 +532,8 @@ void loop()
   else if (state == HOMING)
   {
     // Determine whether each finger is sufficiently straight.
-    bool flex1IsStraight = flex1 >= STRAIGHT_THRESHOLD;
-    bool flex2IsStraight = flex2 >= STRAIGHT_THRESHOLD;
+    bool flex1IsStraight = flex1 <= STRAIGHT_THRESHOLD;
+    bool flex2IsStraight = flex2 <= STRAIGHT_THRESHOLD;
 
 
     // --------------------------------------------------------
