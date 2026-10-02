@@ -72,6 +72,18 @@ int flex2Threshold = 200;
 // <= 60 is provisionally considered sufficiently straight.
 const int STRAIGHT_THRESHOLD = 60;
 
+// Both fingers must remain straight before another grasp is allowed.
+const unsigned long REARM_STRAIGHT_MS = 200;
+bool graspArmed = false;
+bool straightTiming = false;
+unsigned long straightStartTime = 0;
+
+void disarmGrasp()
+{
+  graspArmed = false;
+  straightTiming = false;
+}
+
 // FSR contact threshold.
 // This value should be adjusted after physical testing.
 const int FSR_THRESHOLD = 500;
@@ -231,6 +243,7 @@ void loop()
   if (resetButton == LOW &&
       lastResetButton == HIGH)
   {
+    disarmGrasp();
     state = HOMING;
 
     // Start a new homing operation.
@@ -252,17 +265,22 @@ void loop()
   // 2. User bends fingers to the desired activation position.
   // 3. User presses the SET button.
   // 4. Current Flex readings become the new thresholds.
+  //    Both must exceed STRAIGHT_THRESHOLD to avoid overlap.
   //
   // After calibration:
-  // BOTH Flex readings >= their thresholds -> grasp intention detected.
+  // First straighten both fingers for REARM_STRAIGHT_MS, then bend.
   // ==========================================================
 
   if (setButton == LOW &&
       lastSetButton == HIGH &&
       state == IDLE)
   {
-    flex1Threshold = flex1;
-    flex2Threshold = flex2;
+    disarmGrasp();
+    if (flex1 > STRAIGHT_THRESHOLD && flex2 > STRAIGHT_THRESHOLD)
+    {
+      flex1Threshold = flex1;
+      flex2Threshold = flex2;
+    }
   }
 
 
@@ -280,6 +298,7 @@ void loop()
   if (releaseButton == LOW &&
       lastReleaseButton == HIGH)
   {
+    disarmGrasp();
     if (state == CLOSING || state == HOLD)
     {
       state = OPENING;
@@ -313,8 +332,8 @@ void loop()
   // 1. Motor is disabled.
   // 2. Continuously monitor both Flex sensors.
   // 3. Flex ADC increases when the finger bends.
-  // 4. If BOTH Flex sensors reach or exceed their calibrated
-  //    thresholds, grasp intention is detected.
+  // 4. First require both fingers straight for REARM_STRAIGHT_MS.
+  //    Once armed, BOTH sensors must reach their grasp thresholds.
   // 5. Reset stepCount to zero.
   // 6. Enable the motor.
   // 7. Set direction to CLOSE.
@@ -323,13 +342,44 @@ void loop()
   // Transition:
   //
   // IDLE -> CLOSING
-  // Condition: Flex1 AND Flex2 detect bending.
+  // Condition: armed, all buttons released, and BOTH fingers bent.
   // ==========================================================
 
   if (state == IDLE)
   {
     // Motor remains disabled while waiting.
     digitalWrite(EN_PIN, HIGH);
+
+    // Commands cancel rearming. Holding a button prevents closing.
+    bool buttonsReleased = releaseButton == HIGH &&
+                           resetButton == HIGH && setButton == HIGH;
+    if (!buttonsReleased)
+    {
+      disarmGrasp();
+    }
+    else if (!graspArmed)
+    {
+      bool bothStraight = flex1 <= STRAIGHT_THRESHOLD &&
+                          flex2 <= STRAIGHT_THRESHOLD;
+      if (bothStraight)
+      {
+        unsigned long now = millis();
+        if (!straightTiming)
+        {
+          straightTiming = true;
+          straightStartTime = now;
+        }
+        else if (now - straightStartTime >= REARM_STRAIGHT_MS)
+        {
+          graspArmed = true;
+          straightTiming = false;
+        }
+      }
+      else
+      {
+        straightTiming = false;
+      }
+    }
 
 
     // Check whether each finger is bent.
@@ -338,8 +388,9 @@ void loop()
 
 
     // Both Flex sensors must indicate grasp intention.
-    if (flex1Bent && flex2Bent)
+    if (graspArmed && buttonsReleased && flex1Bent && flex2Bent)
     {
+      disarmGrasp();
       // Start closing.
       state = CLOSING;
 
