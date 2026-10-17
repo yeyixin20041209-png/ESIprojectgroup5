@@ -19,7 +19,7 @@
 // D10 -> ENABLE
 //
 // Flex sensor behaviour:
-// More bending -> HIGHER ADC value
+// More bending -> LOWER ADC value
 //
 // Main control sequence:
 //
@@ -67,14 +67,16 @@ const int EN_PIN   = 10;
 
 // Default Flex activation thresholds.
 // These can be updated using the SET button.
-// 200 is a grasp activation value, not the maximum bend reading.
-// Observed full bending can reach 300 or higher.
-int flex1Threshold = 200;
-int flex2Threshold = 200;
+// Bent readings are around 115; <= 125 allows some fluctuation.
+int flex1Threshold = 125;
+int flex2Threshold = 125;
 
-// Straight Flex is approximately 40.
-// <= 60 is provisionally considered sufficiently straight.
-const int STRAIGHT_THRESHOLD = 60;
+// Straight Flex is approximately 160.
+// >= 155 allows small fluctuations around the measured straight value.
+const int STRAIGHT_THRESHOLD = 155;
+
+const int FLEX_CALIBRATION_GAP = 20;
+const unsigned long FLEX_STABLE_MS = 100;
 
 // FSR contact threshold.
 // This value should be adjusted after physical testing.
@@ -108,8 +110,36 @@ unsigned long lastHomeStepTime = 0;
 int homeStage = 0;  // 0 = entered/stopped, 1 = forward, 2 = reverse
 int homeDirection = 0;  // 0 = STOP, 1 = DIR HIGH, -1 = DIR LOW
 
-// Only enabled after manual zero confirmation; normal startup is unchanged.
-bool waitForStraightAfterHoming = false;
+// Require a new straight-then-bent sequence before each grasp.
+bool graspArmed = false;
+bool straightTiming = false;
+bool bendTiming = false;
+unsigned long straightSince = 0;
+unsigned long bendSince = 0;
+
+void disarmGrasp()
+{
+  graspArmed = false;
+  straightTiming = false;
+  bendTiming = false;
+}
+
+bool flexConditionStable(bool condition, bool &timing,
+                         unsigned long &since)
+{
+  if (!condition)
+  {
+    timing = false;
+    return false;
+  }
+  unsigned long now = millis();
+  if (!timing)
+  {
+    timing = true;
+    since = now;
+  }
+  return now - since >= FLEX_STABLE_MS;
+}
 
 
 // ============================================================
@@ -164,6 +194,8 @@ bool lastSetButton     = HIGH;
 // Debounce RESET so one physical press cannot enter and confirm HOMING.
 bool stableResetButton = HIGH;
 unsigned long resetButtonChangeTime = 0;
+// Require a stable release before accepting the first or next press.
+bool resetReady = false;
 
 
 // ============================================================
@@ -262,6 +294,14 @@ void setup()
   pinMode(RESET_PIN, INPUT_PULLUP);
   pinMode(SET_PIN, INPUT_PULLUP);
 
+  // Sample startup levels; held buttons are not new commands.
+  lastResetButton = digitalRead(RESET_PIN);
+  stableResetButton = lastResetButton;
+  resetButtonChangeTime = millis();
+  resetReady = false;
+  lastReleaseButton = digitalRead(RELEASE_PIN);
+  lastSetButton = digitalRead(SET_PIN);
+
 
   // ----------------------------------------------------------
   // Configure DRV8825 control outputs
@@ -325,11 +365,18 @@ void loop()
   {
     resetButtonChangeTime = buttonTime;
   }
-  if (buttonTime - resetButtonChangeTime >= HOME_BUTTON_DEBOUNCE_MS &&
-      resetButton != stableResetButton)
+  if (buttonTime - resetButtonChangeTime >= HOME_BUTTON_DEBOUNCE_MS)
   {
     stableResetButton = resetButton;
-    resetPressed = (stableResetButton == LOW);
+    if (stableResetButton == HIGH)
+    {
+      resetReady = true;
+    }
+    else if (resetReady)
+    {
+      resetReady = false;
+      resetPressed = true;
+    }
   }
 
 
@@ -347,6 +394,7 @@ void loop()
 
   if (resetPressed)
   {
+    disarmGrasp();
     if (state != HOMING)
     {
       state = HOMING;
@@ -372,7 +420,6 @@ void loop()
       stepCount = 0;
       homeStepCount = 0;
       homeStage = 0;
-      waitForStraightAfterHoming = true;
       homeExitedThisLoop = true;
       state = IDLE;
     }
@@ -386,18 +433,26 @@ void loop()
   // 1. Only works while the system is IDLE.
   // 2. User bends fingers to the desired activation position.
   // 3. User presses the SET button.
-  // 4. Current Flex readings become the new thresholds.
+  // 4. Save readings only if both are at least 20 below straight.
+  // 5. Require straight fingers again before allowing a grasp.
   //
   // After calibration:
-  // BOTH Flex readings >= their thresholds -> grasp intention detected.
+  // BOTH Flex readings <= their thresholds -> grasp intention detected.
   // ==========================================================
 
   if (setButton == LOW &&
       lastSetButton == HIGH &&
-      state == IDLE && !homeExitedThisLoop)
+      state == IDLE && !homeExitedThisLoop &&
+      resetButton == HIGH && stableResetButton == HIGH &&
+      releaseButton == HIGH)
   {
-    flex1Threshold = flex1;
-    flex2Threshold = flex2;
+    disarmGrasp();
+    if (flex1 <= STRAIGHT_THRESHOLD - FLEX_CALIBRATION_GAP &&
+        flex2 <= STRAIGHT_THRESHOLD - FLEX_CALIBRATION_GAP)
+    {
+      flex1Threshold = flex1;
+      flex2Threshold = flex2;
+    }
   }
 
 
@@ -415,6 +470,7 @@ void loop()
   if (releaseButton == LOW &&
       lastReleaseButton == HIGH)
   {
+    disarmGrasp();
     if (state == CLOSING || state == HOLD)
     {
       state = OPENING;
@@ -447,9 +503,9 @@ void loop()
   // Logic:
   // 1. Motor is disabled.
   // 2. Continuously monitor both Flex sensors.
-  // 3. Flex ADC increases when the finger bends.
-  // 4. If BOTH Flex sensors reach or exceed their calibrated
-  //    thresholds, grasp intention is detected.
+  // 3. Flex ADC decreases when the finger bends.
+  // 4. With all buttons released, first confirm BOTH sensors >=155
+  //    for 100 ms, then BOTH <= their thresholds for 100 ms.
   // 5. Reset stepCount to zero.
   // 6. Enable the motor.
   // 7. Set direction to CLOSE.
@@ -468,25 +524,33 @@ void loop()
 
 
     // Check whether each finger is bent.
-    bool flex1Bent = flex1 >= flex1Threshold;
-    bool flex2Bent = flex2 >= flex2Threshold;
+    bool flex1Bent = flex1 <= flex1Threshold;
+    bool flex2Bent = flex2 <= flex2Threshold;
 
 
-    // After manual zero confirmation, first require straight fingers
-    // and released buttons. A later bend can start another grasp.
-    if (waitForStraightAfterHoming)
+    // Buttons cancel readiness; manual commands cannot start a grasp.
+    bool buttonsReleased = resetButton == HIGH && stableResetButton == HIGH &&
+                           releaseButton == HIGH && setButton == HIGH;
+    if (!buttonsReleased || homeExitedThisLoop)
     {
-      if (flex1 <= STRAIGHT_THRESHOLD && flex2 <= STRAIGHT_THRESHOLD &&
-          resetButton == HIGH && stableResetButton == HIGH &&
-          releaseButton == HIGH && setButton == HIGH)
+      disarmGrasp();
+    }
+    else if (!graspArmed)
+    {
+      bool bothStraight = flex1 >= STRAIGHT_THRESHOLD &&
+                          flex2 >= STRAIGHT_THRESHOLD;
+      if (flexConditionStable(bothStraight, straightTiming, straightSince))
       {
-        waitForStraightAfterHoming = false;
+        graspArmed = true;
+        straightTiming = false;
       }
     }
 
     // Both Flex sensors must indicate grasp intention.
-    else if (flex1Bent && flex2Bent)
+    if (flexConditionStable(graspArmed && buttonsReleased &&
+                            flex1Bent && flex2Bent, bendTiming, bendSince))
     {
+      disarmGrasp();
       // Start closing.
       state = CLOSING;
 
@@ -644,6 +708,7 @@ void loop()
 
       // Return to waiting state.
       state = IDLE;
+      disarmGrasp();
     }
   }
 
