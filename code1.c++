@@ -154,6 +154,7 @@ bool lastSetButton     = HIGH;
 // Open Serial Monitor at 115200 baud. Columns use fixed widths.
 // THR1 / THR2 are the current calibrated Flex thresholds.
 // FSR_T is the contact threshold; STR_T is the straight threshold.
+// STEPCOUNT is the recorded closing position (decreases on release).
 // Repeat the header every 20 samples. Queue each sample every
 // 100 ms and send it in chunks without waiting for buffer space.
 // ============================================================
@@ -196,13 +197,13 @@ void printSensorReadings(int flex1, int flex2, int fsr)
   {
     lastSerialTime = now;
     const char *header = rowsSinceHeader == 0
-      ? "STATE   | FLEX1 | THR1 | FLEX2 | THR2 |  FSR | FSR_T | STR_T\r\n"
+      ? "STATE   | FLEX1 | THR1 | FLEX2 | THR2 |  FSR | FSR_T | STR_T |   STEPCOUNT\r\n"
       : "";
     int length = snprintf(output, sizeof(output),
-                          "%s%-7s | %5d | %4d | %5d | %4d | %4d | %5d | %5d\r\n",
+                          "%s%-7s | %5d | %4d | %5d | %4d | %4d | %5d | %5d | %11ld\r\n",
                           header, serialStateName(), flex1, flex1Threshold,
                           flex2, flex2Threshold, fsr, FSR_THRESHOLD,
-                          STRAIGHT_THRESHOLD);
+                          STRAIGHT_THRESHOLD, stepCount);
 
     if (length <= 0 || length >= (int)sizeof(output))
     {
