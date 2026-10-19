@@ -33,8 +33,9 @@
 //   -> stepCount reaches 0
 // IDLE
 //
-// D4 toggles manual HOMING. In HOMING, D5 HIGH turns right;
-// holding D3 turns left with priority. D4 exits and sets a new zero.
+// D4 toggles manual HOMING. D3 HIGH holds left rotation;
+// D5 HIGH holds right rotation. Both LOW or both HIGH stop.
+// D4 exits, stops the motor, and sets a new zero.
 // ============================================================
 
 
@@ -78,8 +79,11 @@ int flex2Threshold = DEFAULT_FLEX_THRESHOLD;
 // >= 155 allows small fluctuations around the measured straight value.
 const int STRAIGHT_THRESHOLD = 155;
 
-// Keep calibrated activation thresholds below the straight threshold.
+// Keep calibrated activation thresholds below the straight threshold. set 时候用 防止误触， 防止set 阈值太高 
 const int FLEX_CALIBRATION_GAP = 20;
+
+//至少100 ms
+
 const unsigned long FLEX_STABLE_MS = 100;
 
 // FSR contact threshold.
@@ -92,8 +96,10 @@ const int FSR_THRESHOLD = 500;
 // ============================================================
 
 // Time between STEP pulses.
-// Smaller value -> faster motor movement.
+// Smaller value -> faster motor movement.不能太快 会丢步
 const unsigned long STEP_INTERVAL = 20000;  // microseconds
+
+// 不能为负数  可以存储较大的整数 初始化为零 记录电机上一次执行步进操作的时间，用来控制电机转速。 
 
 unsigned long lastStepTime = 0;
 
@@ -103,9 +109,19 @@ long stepCount = 0;
 
 // Manual homing directions. Swap these values if the physical motor
 // turns the opposite way with the installed wiring.
+// HOMING_RIGHT_DIR：定义一个方向对应的电平。  HOMING_LEFT_DIR：定义相反方向对应的电平。  homingDirection：保存当前选择的回零方向。
 const int HOMING_RIGHT_DIR = HIGH;
 const int HOMING_LEFT_DIR  = LOW;
 int homingDirection = HOMING_RIGHT_DIR;
+
+enum HomingMotion
+{
+  HOMING_STOPPED,
+  HOMING_LEFT,
+  HOMING_RIGHT
+};
+
+HomingMotion homingMotion = HOMING_STOPPED;
 
 
 // ============================================================
@@ -125,7 +141,8 @@ int homingDirection = HOMING_RIGHT_DIR;
 // Motor reverses the recorded closing steps.
 //
 // HOMING:
-// Manual movement: D3 LOW -> left; otherwise D5 HIGH -> right.
+// Manual movement follows active-HIGH levels, with no toggle/latch.
+// D3 HIGH alone -> left; D5 HIGH alone -> right; equal levels -> stop.
 // D4 is the only command that exits HOMING and sets the new zero.
 //
 enum State
@@ -147,6 +164,8 @@ unsigned long straightSince = 0;
 unsigned long bendSince = 0;
 
 // Confirm a condition only after it remains true continuously for 100 ms.
+// 当手指伸直时，flexConditionStable()函数会被调用，传入参数为true。
+// 函数会检查这个条件是否已经持续了至少100毫秒，如果是，则返回true，表示手指已经稳定地伸直了。否则，返回false，表示手指还没有稳定地伸直。
 bool flexConditionStable(bool condition, bool &timing,
                          unsigned long &since)
 {
@@ -155,7 +174,7 @@ bool flexConditionStable(bool condition, bool &timing,
     timing = false;
     return false;
   }
-
+// 如果条件为真，函数会检查是否已经开始计时。如果还没有开始计时，则将timing设置为true，并记录当前时间为since。
   unsigned long now = millis();
   if (!timing)
   {
@@ -178,34 +197,53 @@ bool flexConditionStable(bool condition, bool &timing,
 // The previous button state is stored so that one physical
 // press is treated as one command instead of being repeatedly
 // triggered while the button is held.
-//
+// 记录上一次按钮状态，初始为HIGH，表示未按下。
 bool lastReleaseButton = HIGH;
-bool lastResetButton   = HIGH;
-bool lastSetButton     = HIGH;
+bool lastResetButton = HIGH;
+bool lastSetButton = HIGH;
 
 // RESET must first be released stably, including after power-up.
+// 同时防止长按、按键抖动以及开机时误触发。 按键状态需要稳定 30 ms 
 const unsigned long RESET_DEBOUNCE_MS = 30;
 bool resetReady = false;
 unsigned long resetLastChange = 0;
 
+// ============================================================
+// BUTTON: RESET / HOME 
 bool resetHomePressed(bool resetButton)
 {
-  unsigned long now = millis();
+  unsigned long now = millis(); //millis() 表示 Arduino 从开始运行到现在经过了多少毫秒。
+
+  // 检查当前按钮状态是否与上一次状态不同，如果不同，则更新lastResetButton和resetLastChange。
+  //如果只写：
+//if (resetButton == LOW)
+//{
+    //state = HOMING;
+//}
+//那么只要按钮一直按着，loop() 就会不断执行 state = HOMING。
+//这可能导致每次循环都重新启动回零操作。
+//所以我们需要检测的是：按钮从 HIGH 变为 LOW 的有效按下事件，而不是按钮一直处于 LOW。//
+
+
   if (resetButton != lastResetButton)
   {
     lastResetButton = resetButton;
     resetLastChange = now;
   }
 
+  // 如果距离上一次状态变化的时间小于防抖时间，则返回false，表示按钮状态不稳定。
   if (now - resetLastChange < RESET_DEBOUNCE_MS)
   {
     return false;
   }
 
+  // 如果按钮被按下，则设置resetReady为true。
   if (resetButton == HIGH)
   {
     resetReady = true;
   }
+
+  // 如果按钮被释放，并且之前已经按下过，则返回true，表示RESET/HOME按钮被按下并释放。
   else if (resetReady)
   {
     resetReady = false;
@@ -213,7 +251,6 @@ bool resetHomePressed(bool resetButton)
   }
   return false;
 }
-
 
 // ============================================================
 // SERIAL STATUS TABLE
@@ -366,9 +403,10 @@ void loop()
   // READ BUTTONS
   // ==========================================================
 
+  // Read the current button states. These are active LOW.
   bool releaseButton = digitalRead(RELEASE_PIN);
-  bool resetButton   = digitalRead(RESET_PIN);
-  bool setButton     = digitalRead(SET_PIN);
+  bool resetButton = digitalRead(RESET_PIN);
+  bool setButton = digitalRead(SET_PIN);
 
 
   // ==========================================================
@@ -382,14 +420,16 @@ void loop()
 
   if (resetHomePressed(resetButton))
   {
-    digitalWrite(EN_PIN, HIGH);
-    digitalWrite(STEP_PIN, LOW);
-    graspArmed = false;
-    straightTiming = false;
-    bendTiming = false;
-    lastStepTime = micros();
 
-    if (state == HOMING)
+    digitalWrite(EN_PIN, HIGH);//禁用 DRV8825 电机驱动器 //需要调整
+    digitalWrite(STEP_PIN, LOW);//将 STEP 信号拉低
+    graspArmed = false;//暂时不允许启动新抓握
+    straightTiming = false;//清除伸直稳定计时状态
+    bendTiming = false;//清除弯曲稳定计时状态
+    lastStepTime = micros();//更新上一次步进时间
+    homingMotion = HOMING_STOPPED;// 将回零运动状态设置为停止
+
+    if (state == HOMING)//如果当前正在回零，再按一次 RESET，就退出 HOMING。
     {
       state = IDLE;
       stepCount = 0;
@@ -397,13 +437,15 @@ void loop()
       flex2Threshold = DEFAULT_FLEX_THRESHOLD;
 
       // Consume the current button levels so leaving HOMING cannot
-      // also calibrate thresholds or trigger a normal release.
+      // also calibrate thresholds or trigger a normal release. 这是为了防止按钮误触发。
+      //例如，退出 HOMING 时，SET 按钮正好处于 LOW（按下）。如果 lastSetButton 仍然是 HIGH，后面的代码可能误认为 SET 刚被按下，进而触发校准。
+      //提前保存当前按钮状态，就能避免这种情况。
       lastReleaseButton = releaseButton;
       lastSetButton = setButton;
       printSensorReadings(flex1, flex2, fsr);
       return;
     }
-
+    //如果不是 HOMING 状态，按下 RESET 就进入 HOMING。 设置初始回零方向为 HOMING_RIGHT_DIR。  将方向信号发送给 DRV8825。
     state = HOMING;
     homingDirection = HOMING_RIGHT_DIR;
     digitalWrite(DIR_PIN, homingDirection);
@@ -423,7 +465,7 @@ void loop()
   // After calibration:
   // BOTH Flex readings <= their thresholds -> grasp intention detected.
   // ==========================================================
-
+  // 只有在 IDLE 状态下，SET 按钮才有效。  当手指弯曲到期望位置时，按下 SET 按钮，保存当前的 Flex 传感器读数作为新的阈值。
   if (setButton == LOW &&
       lastSetButton == HIGH &&
       state == IDLE)
@@ -434,6 +476,7 @@ void loop()
       flex1Threshold = flex1;
       flex2Threshold = flex2;
     }
+    //校准 Flex 阈值后，禁止手套立即自动抓握，必须先让手指重新伸直，才能进行下一次抓握。
     graspArmed = false;
     straightTiming = false;
     bendTiming = false;
@@ -507,13 +550,21 @@ void loop()
   {
     // Motor remains disabled while waiting.
     digitalWrite(EN_PIN, HIGH);
-
+    //确认手指已经伸直
     if (!graspArmed)
     {
+
+      //这个函数的作用是：检查 bothStraight 是否连续保持 true 至少 100 ms。
+      // bothStraight：当前是否伸直。
+      // straightTiming：是否已经开始计算连续伸直的时间。
+      // straightSince：从什么时候开始伸直。
+      // 如果连续满足 100 ms，函数就返回 true。
       bool bothStraight = flex1 >= STRAIGHT_THRESHOLD &&
                           flex2 >= STRAIGHT_THRESHOLD;
       if (flexConditionStable(bothStraight, straightTiming, straightSince))
       {
+        //graspArmed = true 表示系统已经准备好接收抓握动作。
+        //straightTiming = false 则是清除这次伸直检测的计时状态。
         graspArmed = true;
         straightTiming = false;
       }
@@ -534,6 +585,9 @@ void loop()
       straightTiming = false;
       bendTiming = false;
 
+      //graspArmed = false：本次抓握许可已经使用，下次抓握必须重新确认伸直。
+      //straightTiming = false：清除伸直计时状态。
+      //bendTiming = false：清除弯曲计时状态。
 
       // Start recording motor movement from zero.
       stepCount = 0;
@@ -698,37 +752,54 @@ void loop()
   // ==========================================================
   // STATE: HOMING
   //
-  // Read levels continuously, rather than reacting to press edges:
-  // D3 pressed (LOW) -> left, regardless of D5.
-  // Otherwise D5 HIGH -> right; D5 LOW -> stop.
-  // INPUT_PULLUP means both buttons released causes right rotation.
+  // Follow the input levels on every loop, with no toggle/latch:
+  // D3 HIGH and D5 LOW -> left; D5 HIGH and D3 LOW -> right.
+  // Both LOW (released) or both HIGH (conflicting commands) -> stop.
+  // These active-HIGH commands require LOW on release in the wiring.
+  // Stop immediately on release; no button debounce delays stopping.
   // Flex readings do not end manual homing. Only D4 exits.
   // Normal closing stepCount is not used for manual movement.
   // ==========================================================
 
   else if (state == HOMING)
   {
-    bool moveLeft = releaseButton == LOW;
-    bool moveRight = !moveLeft && setButton == HIGH;
+    HomingMotion previousMotion = homingMotion;
 
-    if (!moveLeft && !moveRight)
+    if (releaseButton == HIGH && setButton == LOW)
+    {
+      homingMotion = HOMING_LEFT;
+    }
+    else if (setButton == HIGH && releaseButton == LOW)
+    {
+      homingMotion = HOMING_RIGHT;
+    }
+    else
+    {
+      homingMotion = HOMING_STOPPED;
+    }
+
+    if (homingMotion != previousMotion)
+    {
+      // Stop before starting or reversing. Wait a full step interval
+      // before the next pulse so the new direction can settle.
+      digitalWrite(EN_PIN, HIGH);
+      digitalWrite(STEP_PIN, LOW);
+      lastStepTime = micros();
+      if (homingMotion != HOMING_STOPPED)
+      {
+        homingDirection = homingMotion == HOMING_LEFT
+          ? HOMING_LEFT_DIR : HOMING_RIGHT_DIR;
+        digitalWrite(DIR_PIN, homingDirection);
+      }
+    }
+
+    if (homingMotion == HOMING_STOPPED)
     {
       digitalWrite(EN_PIN, HIGH);
       lastStepTime = micros();
     }
     else
     {
-      int requestedDirection = moveLeft ? HOMING_LEFT_DIR : HOMING_RIGHT_DIR;
-      if (requestedDirection != homingDirection)
-      {
-        // Stop before reversing and wait one full step interval
-        // before the next pulse, allowing DIR to settle.
-        digitalWrite(EN_PIN, HIGH);
-        homingDirection = requestedDirection;
-        digitalWrite(DIR_PIN, homingDirection);
-        lastStepTime = micros();
-      }
-
       digitalWrite(EN_PIN, LOW);
       if (micros() - lastStepTime >= STEP_INTERVAL)
       {
@@ -763,7 +834,7 @@ void makeStep()
 {
   digitalWrite(STEP_PIN, HIGH);
 
-  delayMicroseconds(10);
+  delayMicroseconds(10); 
 
   digitalWrite(STEP_PIN, LOW);
 }

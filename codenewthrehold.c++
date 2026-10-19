@@ -37,7 +37,7 @@
 // ============================================================
 
 
-#include <stdio.h>
+#include <Arduino.h>
 
 // ============================================================
 // PIN DEFINITIONS
@@ -73,12 +73,15 @@ int flex2Threshold = 125;
 // >= 155 allows small fluctuations around the measured straight value.
 const int STRAIGHT_THRESHOLD = 155;
 
-// Keep calibrated activation thresholds below the straight threshold.
+// Keep calibrated activation thresholds below the straight threshold. set 时候用 防止误触， 防止set 阈值太高 
 const int FLEX_CALIBRATION_GAP = 20;
+
+//至少100 ms
+
 const unsigned long FLEX_STABLE_MS = 100;
 
 // FSR contact threshold.
-// This value should be adjusted after physical testing.
+// 
 const int FSR_THRESHOLD = 500;
 
 
@@ -87,8 +90,10 @@ const int FSR_THRESHOLD = 500;
 // ============================================================
 
 // Time between STEP pulses.
-// Smaller value -> faster motor movement.
+// Smaller value -> faster motor movement. 不能太快 会丢步
 const unsigned long STEP_INTERVAL = 20000;  // microseconds
+
+// 不能为负数  可以存储较大的整数 初始化为零 记录电机上一次执行步进操作的时间，用来控制电机转速。 
 
 unsigned long lastStepTime = 0;
 
@@ -589,6 +594,7 @@ void loop()
     else
     {
       // Generate the next STEP only after STEP_INTERVAL.
+      // Arduino 从启动到现在经过的微秒数  上次步进的时间  要求的最小步进间隔  只有间隔达到 20000 微秒，才执行下一步 
       if (micros() - lastStepTime >= STEP_INTERVAL)
       {
         lastStepTime = micros();
