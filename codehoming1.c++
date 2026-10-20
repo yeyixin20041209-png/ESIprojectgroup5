@@ -82,7 +82,7 @@ int flex2Threshold = DEFAULT_FLEX_THRESHOLD;
 // >= 155 allows small fluctuations around the measured straight value.
 const int STRAIGHT_THRESHOLD = 155;
 
-// Keep calibrated activation thresholds below the straight threshold. set 时候用 防止误触， 防止set 阈值太高 
+// 校准阈值上限为 155 - 20 = 135，与伸直阈值留出间隔，避免轻微波动触发抓握。
 const int FLEX_CALIBRATION_GAP = 20;
 
 //至少100 ms
@@ -164,6 +164,7 @@ enum State
 
 State state = IDLE;
 
+// 从第一次 SET 按下开始计时；15 秒内未成功保存就退出，保留原阈值。
 const unsigned long CALIBRATION_TIMEOUT_MS = 15000;
 unsigned long calibrationStarted = 0;
 
@@ -219,6 +220,8 @@ unsigned long setLastChange = 0;
 
 // One event per debounced press, with a stable release between presses.
 // Call every loop, even outside IDLE, so held buttons cannot queue a SET.
+// HIGH 为松开、LOW 为按下；电平稳定 30 ms 后才处理。
+// setReady 在松开后置 true，按下时消耗一次，因此长按不会同时完成“进入”和“保存”。
 bool setThresholdPressed(bool setButton)
 {
   unsigned long now = millis();
@@ -278,13 +281,13 @@ bool resetHomePressed(bool resetButton)
     return false;
   }
 
-  // 如果按钮被按下，则设置resetReady为true。
+  // 按钮稳定松开（HIGH）后，允许识别下一次按下。
   if (resetButton == HIGH)
   {
     resetReady = true;
   }
 
-  // 如果按钮被释放，并且之前已经按下过，则返回true，表示RESET/HOME按钮被按下并释放。
+  // 按钮稳定按下（LOW）且已准备好时，只返回一次 true；长按不会重复触发。
   else if (resetReady)
   {
     resetReady = false;
@@ -509,6 +512,9 @@ void loop()
   // After calibration:
   // BOTH Flex readings <= their thresholds -> grasp intention detected.
   // ==========================================================
+  // 操作：IDLE 按一次 D5 → 松开并摆好弯曲姿势 → 再按 D5 保存。
+  // D3 取消；D4 进入手动回零。校准过程中 loop 继续运行，不阻塞按键和串口。
+  // 先判断超时：即使本轮同时检测到 SET，超时后也不会保存或重新进入校准。
   if (state == CALIBRATING &&
       millis() - calibrationStarted >= CALIBRATION_TIMEOUT_MS)
   {
@@ -525,14 +531,19 @@ void loop()
   }
   else if (setPressed && state == CALIBRATING && releaseButton == HIGH)
   {
+    // 第二次按下才取本轮的两个 ADC 读数（不是多次采样平均值）。
+    // D3 必须处于松开状态，避免同时按下取消键时仍保存阈值。
+    // 两个读数都必须 <= 135；任意一个不合格都保留旧阈值，继续等待重试。
     if (flex1 <= STRAIGHT_THRESHOLD - FLEX_CALIBRATION_GAP &&
         flex2 <= STRAIGHT_THRESHOLD - FLEX_CALIBRATION_GAP)
     {
+      // 两个传感器各自保存阈值；仅保存在 RAM，断电重启恢复默认值。
       flex1Threshold = flex1;
       flex2Threshold = flex2;
       state = IDLE;
     }
-    //校准 Flex 阈值后，禁止手套立即自动抓握，必须先让手指重新伸直，才能进行下一次抓握。
+    // 清除抓握许可和稳定计时；返回 IDLE 后须先双指伸直稳定 100 ms，再弯曲触发。
+    // 无效读数重试不会重置 calibrationStarted，15 秒仍从首次进入校准计算。
     graspArmed = false;
     straightTiming = false;
     bendTiming = false;
@@ -556,6 +567,7 @@ void loop()
   {
     if (state == CALIBRATING)
     {
+      // 取消只退出状态，不改动 flex1Threshold / flex2Threshold。
       state = IDLE;
     }
     else if (state == CLOSING || state == HOLD)
@@ -670,6 +682,7 @@ void loop()
   else if (state == CALIBRATING)
   {
     // Wait without stepping or running the automatic grasp detector.
+    // 禁用驱动并保持 STEP 为 LOW，用户调整手指姿势时不会启动自动抓握。
     digitalWrite(EN_PIN, HIGH);
     digitalWrite(STEP_PIN, LOW);
   }
