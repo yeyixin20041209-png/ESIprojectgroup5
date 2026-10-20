@@ -36,6 +36,9 @@
 // D4 toggles manual HOMING. D3 HIGH holds left rotation;
 // D5 HIGH holds right rotation. Both LOW or both HIGH stop.
 // D4 exits, stops the motor, and sets a new zero.
+// In IDLE, press D5 once to enter calibration; release it, position
+// fingers, then press D5 again within 15 seconds to save thresholds.
+// D3 cancels calibration. Serial STATE shows CALIBRATING while pending.
 // ============================================================
 
 
@@ -131,11 +134,15 @@ HomingMotion homingMotion = HOMING_STOPPED;
 // IDLE:
 // Wait for grasp intention.
 //
+// CALIBRATING:
+// First SET enters; release and press SET again to save. No grasping.
+// RELEASE cancels; RESET enters HOMING; timeout keeps old thresholds.
+//
 // CLOSING:
 // Motor pulls the tendon and closes the fingers.
 //
 // HOLD:
-// FSR has detected contact. Motor stops.
+// FSR has detected contact. STEP stops; driver stays enabled for torque.
 //
 // OPENING:
 // Motor reverses the recorded closing steps.
@@ -148,6 +155,7 @@ HomingMotion homingMotion = HOMING_STOPPED;
 enum State
 {
   IDLE,
+  CALIBRATING,
   CLOSING,
   HOLD,
   OPENING,
@@ -155,6 +163,9 @@ enum State
 };
 
 State state = IDLE;
+
+const unsigned long CALIBRATION_TIMEOUT_MS = 15000;
+unsigned long calibrationStarted = 0;
 
 // Require straight fingers before each new grasp, including at startup.
 bool graspArmed = false;
@@ -201,6 +212,36 @@ bool flexConditionStable(bool condition, bool &timing,
 bool lastReleaseButton = HIGH;
 bool lastResetButton = HIGH;
 bool lastSetButton = HIGH;
+
+const unsigned long SET_DEBOUNCE_MS = 30;
+bool setReady = false;
+unsigned long setLastChange = 0;
+
+// One event per debounced press, with a stable release between presses.
+// Call every loop, even outside IDLE, so held buttons cannot queue a SET.
+bool setThresholdPressed(bool setButton)
+{
+  unsigned long now = millis();
+  if (setButton != lastSetButton)
+  {
+    lastSetButton = setButton;
+    setLastChange = now;
+  }
+  if (now - setLastChange < SET_DEBOUNCE_MS)
+  {
+    return false;
+  }
+  if (setButton == HIGH)
+  {
+    setReady = true;
+  }
+  else if (setReady)
+  {
+    setReady = false;
+    return true;
+  }
+  return false;
+}
 
 // RESET must first be released stably, including after power-up.
 // 同时防止长按、按键抖动以及开机时误触发。 按键状态需要稳定 30 ms 
@@ -271,6 +312,7 @@ const char *serialStateName()
   switch (state)
   {
     case IDLE:    return "IDLE";
+    case CALIBRATING: return "CALIBRATING";
     case CLOSING: return "CLOSING";
     case HOLD:    return "HOLD";
     case OPENING: return "OPENING";
@@ -300,10 +342,10 @@ void printSensorReadings(int flex1, int flex2, int fsr)
   {
     lastSerialTime = now;
     const char *header = rowsSinceHeader == 0
-      ? "STATE   | FLEX1 | THR1 | FLEX2 | THR2 |  FSR | FSR_T | STR_T |   STEPCOUNT\r\n"
+      ? "STATE       | FLEX1 | THR1 | FLEX2 | THR2 |  FSR | FSR_T | STR_T |   STEPCOUNT\r\n"
       : "";
     int length = snprintf(output, sizeof(output),
-                          "%s%-7s | %5d | %4d | %5d | %4d | %4d | %5d | %5d | %11ld\r\n",
+                          "%s%-11s | %5d | %4d | %5d | %4d | %4d | %5d | %5d | %11ld\r\n",
                           header, serialStateName(), flex1, flex1Threshold,
                           flex2, flex2Threshold, fsr, FSR_THRESHOLD,
                           STRAIGHT_THRESHOLD, stepCount);
@@ -407,6 +449,7 @@ void loop()
   bool releaseButton = digitalRead(RELEASE_PIN);
   bool resetButton = digitalRead(RESET_PIN);
   bool setButton = digitalRead(SET_PIN);
+  bool setPressed = setThresholdPressed(setButton);
 
 
   // ==========================================================
@@ -436,12 +479,11 @@ void loop()
       flex1Threshold = DEFAULT_FLEX_THRESHOLD;
       flex2Threshold = DEFAULT_FLEX_THRESHOLD;
 
-      // Consume the current button levels so leaving HOMING cannot
-      // also calibrate thresholds or trigger a normal release. 这是为了防止按钮误触发。
-      //例如，退出 HOMING 时，SET 按钮正好处于 LOW（按下）。如果 lastSetButton 仍然是 HIGH，后面的代码可能误认为 SET 刚被按下，进而触发校准。
-      //提前保存当前按钮状态，就能避免这种情况。
+      // Require a fresh SET release/press after leaving HOMING.
+      // Consume RELEASE so exiting cannot also trigger normal opening.
       lastReleaseButton = releaseButton;
-      lastSetButton = setButton;
+      setReady = false;
+      setLastChange = millis();
       printSensorReadings(flex1, flex2, fsr);
       return;
     }
@@ -456,25 +498,39 @@ void loop()
   // BUTTON: SET FLEX THRESHOLD
   //
   // Logic:
-  // 1. Only works while the system is IDLE.
-  // 2. User bends fingers to the desired activation position.
-  // 3. User presses the SET button.
-  // 4. Save both readings only if each is at least 20 below 155.
-  // 5. Require straight fingers again before allowing a grasp.
+  // 1. First debounced SET press in IDLE enters CALIBRATING.
+  // 2. Release SET and bend fingers to the desired activation position.
+  // 3. A second debounced press saves both readings if each <= 135.
+  //    Invalid readings leave calibration pending; release and retry.
+  // 4. RELEASE or a 15-second timeout cancels without saving.
+  // 5. No automatic grasping during calibration. Require straight
+  //    fingers again after saving/cancelling. Never block on a button.
   //
   // After calibration:
   // BOTH Flex readings <= their thresholds -> grasp intention detected.
   // ==========================================================
-  // 只有在 IDLE 状态下，SET 按钮才有效。  当手指弯曲到期望位置时，按下 SET 按钮，保存当前的 Flex 传感器读数作为新的阈值。
-  if (setButton == LOW &&
-      lastSetButton == HIGH &&
-      state == IDLE)
+  if (state == CALIBRATING &&
+      millis() - calibrationStarted >= CALIBRATION_TIMEOUT_MS)
+  {
+    state = IDLE;
+  }
+  else if (setPressed && state == IDLE)
+  {
+    // 第一次只进入校准，不修改阈值；校准时暂停自动抓握。
+    state = CALIBRATING;
+    calibrationStarted = millis();
+    graspArmed = false;
+    straightTiming = false;
+    bendTiming = false;
+  }
+  else if (setPressed && state == CALIBRATING && releaseButton == HIGH)
   {
     if (flex1 <= STRAIGHT_THRESHOLD - FLEX_CALIBRATION_GAP &&
         flex2 <= STRAIGHT_THRESHOLD - FLEX_CALIBRATION_GAP)
     {
       flex1Threshold = flex1;
       flex2Threshold = flex2;
+      state = IDLE;
     }
     //校准 Flex 阈值后，禁止手套立即自动抓握，必须先让手指重新伸直，才能进行下一次抓握。
     graspArmed = false;
@@ -487,6 +543,7 @@ void loop()
   // BUTTON: RELEASE
   //
   // Logic:
+  // During CALIBRATING, cancel and retain the previous thresholds.
   // 1. Works while the glove is CLOSING or HOLDING.
   // 2. Change state to OPENING.
   // 3. Enable the motor.
@@ -497,7 +554,11 @@ void loop()
   if (releaseButton == LOW &&
       lastReleaseButton == HIGH)
   {
-    if (state == CLOSING || state == HOLD)
+    if (state == CALIBRATING)
+    {
+      state = IDLE;
+    }
+    else if (state == CLOSING || state == HOLD)
     {
       state = OPENING;
       graspArmed = false;
@@ -516,14 +577,13 @@ void loop()
   // ==========================================================
   // SAVE BUTTON STATES
   //
-  // Used for RELEASE and SET edge detection.
-  // RESET is tracked separately by resetHomePressed().
+  // Used for RELEASE edge detection.
+  // RESET and SET are tracked by their debounced press helpers.
   // A command is triggered only when the button changes
   // from HIGH -> LOW.
   // ==========================================================
 
   lastReleaseButton = releaseButton;
-  lastSetButton     = setButton;
 
 
   // ==========================================================
@@ -604,6 +664,18 @@ void loop()
 
 
   // ==========================================================
+  // STATE: CALIBRATING
+  // ==========================================================
+
+  else if (state == CALIBRATING)
+  {
+    // Wait without stepping or running the automatic grasp detector.
+    digitalWrite(EN_PIN, HIGH);
+    digitalWrite(STEP_PIN, LOW);
+  }
+
+
+  // ==========================================================
   // STATE: CLOSING
   //
   // Logic:
@@ -637,8 +709,9 @@ void loop()
       state = HOLD;
 
 
-      // Stop motor to prevent further tightening.
-      digitalWrite(EN_PIN, HIGH);
+      // 停转不停机：停止 STEP，保持驱动使能以提供保持扭矩。
+      digitalWrite(STEP_PIN, LOW);
+      digitalWrite(EN_PIN, LOW);
     }
 
 
@@ -670,8 +743,8 @@ void loop()
   //
   // Logic:
   // 1. FSR has detected contact with an object.
-  // 2. The motor remains disabled.
-  // 3. This prevents additional tendon tightening.
+  // 2. The driver remains enabled to provide holding torque.
+  // 3. No STEP pulses are sent, preventing commanded tightening.
   // 4. The system waits for a user command.
   //
   // Transitions:
@@ -685,8 +758,9 @@ void loop()
 
   else if (state == HOLD)
   {
-    // Keep motor disabled.
-    digitalWrite(EN_PIN, HIGH);
+    // Hold position with coil current; do not generate STEP pulses.
+    digitalWrite(EN_PIN, LOW);
+    digitalWrite(STEP_PIN, LOW);
   }
 
 
