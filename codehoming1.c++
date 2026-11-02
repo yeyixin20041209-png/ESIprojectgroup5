@@ -82,9 +82,6 @@ int flex2Threshold = DEFAULT_FLEX_THRESHOLD;
 // >= 155 allows small fluctuations around the measured straight value.
 const int STRAIGHT_THRESHOLD = 155;
 
-// 校准阈值上限为 155 - 20 = 135，与伸直阈值留出间隔，避免轻微波动触发抓握。
-const int FLEX_CALIBRATION_GAP = 20;
-
 //至少100 ms
 
 const unsigned long FLEX_STABLE_MS = 100;
@@ -167,6 +164,8 @@ State state = IDLE;
 // 从第一次 SET 按下开始计时；15 秒内未成功保存就退出，保留原阈值。
 const unsigned long CALIBRATION_TIMEOUT_MS = 15000;
 unsigned long calibrationStarted = 0;
+// Keep the latest calibration result visible in the serial table.
+const char *calibrationStatus = "DEFAULT";
 
 // Require straight fingers before each new grasp, including at startup.
 bool graspArmed = false;
@@ -217,6 +216,7 @@ bool lastSetButton = HIGH;
 const unsigned long SET_DEBOUNCE_MS = 30;
 bool setReady = false;
 unsigned long setLastChange = 0;
+unsigned long setPressCount = 0;
 
 // One event per debounced press, with a stable release between presses.
 // Call every loop, even outside IDLE, so held buttons cannot queue a SET.
@@ -241,6 +241,7 @@ bool setThresholdPressed(bool setButton)
   else if (setReady)
   {
     setReady = false;
+    ++setPressCount;
     return true;
   }
   return false;
@@ -300,6 +301,9 @@ bool resetHomePressed(bool resetButton)
 // SERIAL STATUS TABLE
 // Open Serial Monitor at 115200 baud. Columns use fixed widths.
 // THR1 / THR2 are the current calibrated Flex thresholds.
+// CAL_RESULT: WAITING, SAVED, CANCELLED, TIMEOUT, or DEFAULT.
+// D3/D5: raw levels (INPUT_PULLUP: released=1, pressed=0).
+// READY: SET release accepted; SET_N: total debounced SET presses.
 // FSR_T is the contact threshold; STR_T is the straight threshold.
 // STEPCOUNT is the recorded closing position (decreases on release).
 // Repeat the header every 20 samples. Queue each sample every
@@ -326,7 +330,7 @@ const char *serialStateName()
 
 void printSensorReadings(int flex1, int flex2, int fsr)
 {
-  static char output[192];
+  static char output[320];
   static size_t outputLength = 0;
   static size_t outputOffset = 0;
   static unsigned int rowsSinceHeader = 0;
@@ -345,13 +349,15 @@ void printSensorReadings(int flex1, int flex2, int fsr)
   {
     lastSerialTime = now;
     const char *header = rowsSinceHeader == 0
-      ? "STATE       | FLEX1 | THR1 | FLEX2 | THR2 |  FSR | FSR_T | STR_T |   STEPCOUNT\r\n"
+      ? "STATE       | FLEX1 | THR1 | FLEX2 | THR2 |  FSR | FSR_T | STR_T |   STEPCOUNT | CAL_RESULT | D3 | D5 | READY | SET_N\r\n"
       : "";
     int length = snprintf(output, sizeof(output),
-                          "%s%-11s | %5d | %4d | %5d | %4d | %4d | %5d | %5d | %11ld\r\n",
+                          "%s%-11s | %5d | %4d | %5d | %4d | %4d | %5d | %5d | %11ld | %-10s | %2d | %2d | %5d | %lu\r\n",
                           header, serialStateName(), flex1, flex1Threshold,
                           flex2, flex2Threshold, fsr, FSR_THRESHOLD,
-                          STRAIGHT_THRESHOLD, stepCount);
+                          STRAIGHT_THRESHOLD, stepCount, calibrationStatus,
+                          digitalRead(RELEASE_PIN), digitalRead(SET_PIN),
+                          (int)setReady, setPressCount);
 
     if (length <= 0 || length >= (int)sizeof(output))
     {
@@ -441,7 +447,7 @@ void loop()
 
   int flex1 = analogRead(FLEX1_PIN);
   int flex2 = analogRead(FLEX2_PIN);
-  int fsr   = analogRead(FSR_PIN);
+  int fsr = analogRead(FSR_PIN);
 
 
   // ==========================================================
@@ -453,6 +459,7 @@ void loop()
   bool resetButton = digitalRead(RESET_PIN);
   bool setButton = digitalRead(SET_PIN);
   bool setPressed = setThresholdPressed(setButton);
+  bool releasePressed = releaseButton == LOW && lastReleaseButton == HIGH;
 
 
   // ==========================================================
@@ -481,6 +488,7 @@ void loop()
       stepCount = 0;
       flex1Threshold = DEFAULT_FLEX_THRESHOLD;
       flex2Threshold = DEFAULT_FLEX_THRESHOLD;
+      calibrationStatus = "DEFAULT";
 
       // Require a fresh SET release/press after leaving HOMING.
       // Consume RELEASE so exiting cannot also trigger normal opening.
@@ -491,6 +499,10 @@ void loop()
       return;
     }
     //如果不是 HOMING 状态，按下 RESET 就进入 HOMING。 设置初始回零方向为 HOMING_RIGHT_DIR。  将方向信号发送给 DRV8825。
+    if (state == CALIBRATING)
+    {
+      calibrationStatus = "CANCELLED";
+    }
     state = HOMING;
     homingDirection = HOMING_RIGHT_DIR;
     digitalWrite(DIR_PIN, homingDirection);
@@ -503,8 +515,8 @@ void loop()
   // Logic:
   // 1. First debounced SET press in IDLE enters CALIBRATING.
   // 2. Release SET and bend fingers to the desired activation position.
-  // 3. A second debounced press saves both readings if each <= 135.
-  //    Invalid readings leave calibration pending; release and retry.
+  // 3. A second debounced press saves both current ADC readings.
+  //    Each sensor gets its own threshold; there is no fixed 135 cap.
   // 4. RELEASE or a 15-second timeout cancels without saving.
   // 5. No automatic grasping during calibration. Require straight
   //    fingers again after saving/cancelling. Never block on a button.
@@ -515,35 +527,39 @@ void loop()
   // 操作：IDLE 按一次 D5 → 松开并摆好弯曲姿势 → 再按 D5 保存。
   // D3 取消；D4 进入手动回零。校准过程中 loop 继续运行，不阻塞按键和串口。
   // 先判断超时：即使本轮同时检测到 SET，超时后也不会保存或重新进入校准。
-  if (state == CALIBRATING &&
+  if (state == CALIBRATING && releasePressed)
+  {
+    // A new RELEASE press cancels, including simultaneous SET/RELEASE.
+    state = IDLE;
+    calibrationStatus = "CANCELLED";
+  }
+  else if (state == CALIBRATING &&
       millis() - calibrationStarted >= CALIBRATION_TIMEOUT_MS)
   {
     state = IDLE;
+    calibrationStatus = "TIMEOUT";
   }
   else if (setPressed && state == IDLE)
   {
     // 第一次只进入校准，不修改阈值；校准时暂停自动抓握。
     state = CALIBRATING;
+    calibrationStatus = "WAITING";
     calibrationStarted = millis();
     graspArmed = false;
     straightTiming = false;
     bendTiming = false;
   }
-  else if (setPressed && state == CALIBRATING && releaseButton == HIGH)
+  else if (setPressed && state == CALIBRATING)
   {
     // 第二次按下才取本轮的两个 ADC 读数（不是多次采样平均值）。
-    // D3 必须处于松开状态，避免同时按下取消键时仍保存阈值。
-    // 两个读数都必须 <= 135；任意一个不合格都保留旧阈值，继续等待重试。
-    if (flex1 <= STRAIGHT_THRESHOLD - FLEX_CALIBRATION_GAP &&
-        flex2 <= STRAIGHT_THRESHOLD - FLEX_CALIBRATION_GAP)
-    {
-      // 两个传感器各自保存阈值；仅保存在 RAM，断电重启恢复默认值。
-      flex1Threshold = flex1;
-      flex2Threshold = flex2;
-      state = IDLE;
-    }
+    // D3 新按下事件已在上方优先处理；不再用 D3 持续电平阻止保存。
+    // 直接保存当前值，不再要求两个读数都 <= 135。
+    // 两个传感器各自保存阈值；仅保存在 RAM，断电重启恢复默认值。
+    flex1Threshold = flex1;
+    flex2Threshold = flex2;
+    state = IDLE;
+    calibrationStatus = "SAVED";
     // 清除抓握许可和稳定计时；返回 IDLE 后须先双指伸直稳定 100 ms，再弯曲触发。
-    // 无效读数重试不会重置 calibrationStarted，15 秒仍从首次进入校准计算。
     graspArmed = false;
     straightTiming = false;
     bendTiming = false;
@@ -562,13 +578,13 @@ void loop()
   // 5. OPENING state reverses the recorded closing steps.
   // ==========================================================
 
-  if (releaseButton == LOW &&
-      lastReleaseButton == HIGH)
+  if (releasePressed)
   {
     if (state == CALIBRATING)
     {
       // 取消只退出状态，不改动 flex1Threshold / flex2Threshold。
       state = IDLE;
+      calibrationStatus = "CANCELLED";
     }
     else if (state == CLOSING || state == HOLD)
     {
@@ -850,6 +866,7 @@ void loop()
 
   else if (state == HOMING)
   {
+    // Save the previous motion state to detect changes.
     HomingMotion previousMotion = homingMotion;
 
     if (releaseButton == HIGH && setButton == LOW)
